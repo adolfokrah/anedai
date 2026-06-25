@@ -1,0 +1,16 @@
+node_modules
+dist
+.next
+next-env.d.ts
+.turbo
+*.local
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+coverage
+*.tsbuildinfo
+
+# Weave project store (manifests for sandbox-backed projects)
+data
