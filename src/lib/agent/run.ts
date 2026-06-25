@@ -25,6 +25,21 @@ export interface ChatResult {
   ok: boolean;
   sessionId?: string;
   error?: string;
+  /** Conventional Commit subject the agent ended with (commit + PR title). */
+  summary?: string;
+}
+
+const CONVENTIONAL =
+  /^(feat|fix|chore|refactor|docs|style|test|perf|build|ci)(\(.+?\))?!?:\s+.+/i;
+
+/** Pull the last Conventional Commit subject line out of the agent's prose. */
+function extractSummary(text: string): string | undefined {
+  let found: string | undefined;
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (CONVENTIONAL.test(line)) found = line.slice(0, 72);
+  }
+  return found;
 }
 
 /**
@@ -43,7 +58,7 @@ const DESIGN_DIRECTIVE = `DESIGN — make it look like a polished, modern produc
 Use Tailwind utility classes (the scratch scaffold has Tailwind v4 ready). Install lucide-react / recharts via run_cmd when they elevate the result.`;
 
 function systemPrompt(manifest: ProjectManifest): string {
-  return `You are Weave's coding agent and a senior product designer. You edit a REAL, running React app inside a sandbox using ONLY the provided sandbox tools (read_file, write_file, str_replace, list_dir, grep, run_cmd). All paths are relative to the app root. A dev server is already running with hot reload — do NOT start, stop, or restart it; your file edits appear in the live preview automatically.
+  return `You are Aned's coding agent and a senior product designer. You edit a REAL, running React app inside a sandbox using ONLY the provided sandbox tools (read_file, write_file, str_replace, list_dir, grep, run_cmd, web_fetch). All paths are relative to the app root. A dev server is already running with hot reload — do NOT start, stop, or restart it; your file edits appear in the live preview automatically.
 
 Project: ${manifest.name} (${manifest.mode === 'repo' ? 'connected repo' : 'built from scratch'}).
 
@@ -51,7 +66,8 @@ Guidelines:
 - Explore with list_dir/grep/read_file before editing; match the project's existing conventions, framework, and styling.
 - Prefer str_replace for small edits; write_file for new files or full rewrites.
 - Use run_cmd to install packages (e.g. "npm install <pkg>") when genuinely needed — never to launch servers.
-- Keep changes focused on the request. End with one short sentence describing what changed.
+- NEVER run git (commit/branch/checkout/push/merge/pull) via run_cmd. Aned owns version control — it branches, commits, and pushes around your work automatically. Just edit files.
+- Keep changes focused on the request. End your reply with a final line that is a Conventional Commit subject — \`<type>: <summary>\` where type is one of feat, fix, chore, refactor, docs, style, test, perf (≤70 chars, lowercase summary). It becomes the commit message + PR title. Example: \`feat: add pricing page with three tiers\`.
 - For ANY UI/design work (new screens, layouts, components, restyles, redesigns), FIRST invoke the **design-taste-frontend** skill and follow its process — read the brief, state the design read, then build. Do not free-hand a generic interface.
 - The design system is the source of truth: compose screens from its components by reference; never redefine a component inline on a page. If something is missing, add it to the design system first, then use it.
 
@@ -118,12 +134,14 @@ export async function runProjectChat(
   });
 
   let sessionId: string | undefined;
+  let transcript = '';
   try {
     for await (const msg of run) {
       if ('session_id' in msg && msg.session_id) sessionId = msg.session_id;
       if (msg.type === 'assistant') {
         for (const block of msg.message.content) {
           if (block.type === 'text' && block.text.trim()) {
+            transcript += `${block.text}\n`;
             emit({ type: 'text', text: block.text });
           } else if (block.type === 'tool_use') {
             emit({
@@ -134,7 +152,8 @@ export async function runProjectChat(
           }
         }
       } else if (msg.type === 'result') {
-        if (msg.subtype === 'success') return { ok: true, sessionId };
+        if (msg.subtype === 'success')
+          return { ok: true, sessionId, summary: extractSummary(transcript) };
         const detail =
           'errors' in msg && Array.isArray(msg.errors) && msg.errors.length
             ? msg.errors.join('; ')

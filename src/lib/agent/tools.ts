@@ -116,6 +116,28 @@ export function sandboxTools(box: Box, app: string) {
           return text(`exit ${r.exitCode}\n${out}`, r.exitCode !== 0);
         },
       ),
+      tool(
+        'web_fetch',
+        'Fetch a public URL (docs, an API, a reference page) and return its text content. Use to look up library docs/APIs while building. HTML is reduced to readable text.',
+        { url: z.string() },
+        async ({ url }) => {
+          const blocked = blockedUrl(url);
+          if (blocked) return text(blocked, true);
+          try {
+            const res = await fetch(url, {
+              redirect: 'follow',
+              headers: { 'user-agent': 'AnedAgent/1.0' },
+              signal: AbortSignal.timeout(20_000),
+            });
+            const ct = res.headers.get('content-type') ?? '';
+            const raw = await res.text();
+            const body = ct.includes('html') ? stripHtml(raw) : raw;
+            return text(`(${res.status} ${ct})\n${body}`, !res.ok);
+          } catch (e) {
+            return text(`fetch failed: ${msg(e)}`, true);
+          }
+        },
+      ),
     ],
   });
 
@@ -126,6 +148,7 @@ export function sandboxTools(box: Box, app: string) {
     'mcp__sandbox__list_dir',
     'mcp__sandbox__grep',
     'mcp__sandbox__run_cmd',
+    'mcp__sandbox__web_fetch',
   ];
 
   return { server, allowedTools };
@@ -133,6 +156,48 @@ export function sandboxTools(box: Box, app: string) {
 
 function msg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/** Reject non-http(s) and private/loopback/metadata hosts (basic SSRF guard). */
+function blockedUrl(url: string): string | null {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return 'invalid URL';
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+    return 'only http(s) URLs are allowed';
+  }
+  const h = u.hostname.toLowerCase();
+  if (
+    h === 'localhost' ||
+    h === '127.0.0.1' ||
+    h === '::1' ||
+    h === '169.254.169.254' || // cloud metadata
+    h.endsWith('.local') ||
+    /^10\./.test(h) ||
+    /^192\.168\./.test(h) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(h)
+  ) {
+    return 'that host is not allowed';
+  }
+  return null;
+}
+
+/** Reduce HTML to readable text (drop scripts/styles/tags, collapse space). */
+function stripHtml(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 function shellArg(s: string): string {

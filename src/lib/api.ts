@@ -1,4 +1,4 @@
-/** Browser client for Weave's /api routes. */
+/** Browser client for Aned's /api routes. */
 
 import type { AgentEvent, FileNode, ProjectManifest } from './types';
 
@@ -8,6 +8,21 @@ async function json<T>(res: Response): Promise<T> {
     throw new Error(body.error ?? `${res.status} ${res.statusText}`);
   }
   return res.json() as Promise<T>;
+}
+
+export function listProjects(): Promise<ProjectManifest[]> {
+  return fetch('/api/projects').then(json<ProjectManifest[]>);
+}
+
+export function renameProject(
+  slug: string,
+  name: string,
+): Promise<ProjectManifest> {
+  return fetch(`/api/projects/${slug}/rename`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name }),
+  }).then(json<ProjectManifest>);
 }
 
 export function getProject(slug: string): Promise<ProjectManifest> {
@@ -108,4 +123,30 @@ export function ship(
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(opts),
   }).then(json<{ url?: string; ok: boolean; error?: string }>);
+}
+
+export function githubStatus(): Promise<{
+  connected: boolean;
+  login: string | null;
+  oauth: boolean;
+}> {
+  return fetch('/api/auth/github/status').then(
+    json<{ connected: boolean; login: string | null; oauth: boolean }>,
+  );
+}
+
+export function mergePr(
+  slug: string,
+): Promise<{ url?: string; ok: boolean; error?: string }> {
+  return fetch(`/api/projects/${slug}/merge`, { method: 'POST' }).then(
+    json<{ url?: string; ok: boolean; error?: string }>,
+  );
+}
+
+export function endSession(
+  slug: string,
+): Promise<{ ok: boolean; branch?: string; manifest?: ProjectManifest }> {
+  return fetch(`/api/projects/${slug}/session`, { method: 'POST' }).then(
+    json<{ ok: boolean; branch?: string; manifest?: ProjectManifest }>,
+  );
 }

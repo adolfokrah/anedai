@@ -1,4 +1,4 @@
-/** Shared types for Weave's sandbox-backed projects. */
+/** Shared types for Aned's sandbox-backed projects. */
 
 /** How a project was seeded. */
 export type ProjectMode = 'repo' | 'scratch';
@@ -19,8 +19,15 @@ export interface ProjectManifest {
   repoUrl?: string;
   /** Initial build prompt (scratch mode). */
   initialPrompt?: string;
-  /** Working branch the agent commits to. */
+  /** Working/session branch Aned commits to (created off baseBranch). */
   branch: string;
+  /** Default branch PRs target (main/master). */
+  baseBranch?: string;
+  /** Open PR for the current session, if any. */
+  prUrl?: string;
+  prNumber?: number;
+  /** Session counter, for fresh branch names after a merge. */
+  sessionN?: number;
   /** E2B sandbox id, for reconnecting across requests. */
   sandboxId?: string;
   /** Port the dev server listens on inside the sandbox. */

@@ -1,12 +1,15 @@
 'use client';
 
 import { ArrowRight, GitBranch, Sparkles } from 'lucide-react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import * as api from '@/lib/api';
 import { DEFAULT_MODEL } from '@/lib/models';
+import type { ProjectManifest } from '@/lib/types';
 
 type Tab = 'scratch' | 'repo';
 
@@ -17,6 +20,14 @@ export default function Landing() {
   const [repoUrl, setRepoUrl] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [projects, setProjects] = useState<ProjectManifest[]>([]);
+
+  useEffect(() => {
+    api
+      .listProjects()
+      .then(setProjects)
+      .catch(() => {});
+  }, []);
 
   async function create() {
     setBusy(true);
@@ -118,6 +129,40 @@ export default function Landing() {
       </div>
 
       {error && <p className='mt-3 text-sm text-destructive'>{error}</p>}
+
+      {projects.length > 0 && (
+        <div className='mt-10'>
+          <p className='mb-2 px-1 text-xs font-medium tracking-wide text-muted-foreground/70 uppercase'>
+            Your projects
+          </p>
+          <div className='divide-y divide-border/60 overflow-hidden rounded-xl border border-border/60 bg-card/40'>
+            {projects.map((p) => (
+              <Link
+                key={p.slug}
+                href={`/projects/${p.slug}`}
+                className='flex items-center gap-3 px-3.5 py-2.5 transition-colors hover:bg-muted/50'
+              >
+                <span
+                  className={`size-1.5 shrink-0 rounded-full ${
+                    p.status === 'ready'
+                      ? 'bg-emerald-500'
+                      : p.status === 'error'
+                        ? 'bg-destructive'
+                        : 'bg-muted-foreground/40'
+                  }`}
+                />
+                <span className='min-w-0 flex-1 truncate text-sm'>
+                  {p.name}
+                </span>
+                <span className='shrink-0 text-xs text-muted-foreground'>
+                  {p.mode === 'repo' ? 'repo' : 'scratch'}
+                </span>
+                <ArrowRight className='size-3.5 shrink-0 text-muted-foreground/50' />
+              </Link>
+            ))}
+          </div>
+        </div>
+      )}
     </main>
   );
 }

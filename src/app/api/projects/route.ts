@@ -39,7 +39,7 @@ export async function POST(req: Request) {
     mode,
     repoUrl: mode === 'repo' ? body.repoUrl?.trim() : undefined,
     initialPrompt: mode === 'scratch' ? body.initialPrompt?.trim() : undefined,
-    branch: `weave/${slug}`,
+    branch: `aned/${slug}`,
     devPort: 3000,
     status: 'new',
     createdAt: new Date().toISOString(),

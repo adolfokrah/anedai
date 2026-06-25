@@ -7,6 +7,7 @@
  * preview, ship) is identical.
  */
 
+import { detectDefaultBranch } from '@/lib/git';
 import { runtime } from '@/lib/runtime';
 import type { Box } from '@/lib/runtime/types';
 import { saveProject } from '@/lib/store';
@@ -14,7 +15,7 @@ import type { AgentEvent, ProjectManifest } from '@/lib/types';
 
 import { SCRATCH_DEV_PORT, SCRATCH_TEMPLATE } from './template';
 
-const GIT_ID = '-c user.email=agent@weave.dev -c user.name=Weave';
+const GIT_ID = '-c user.email=agent@aned.dev -c user.name=Aned';
 
 type Emit = (e: AgentEvent) => void;
 
@@ -123,7 +124,8 @@ export async function seedProject(
   const app = `${home}/app`;
   emit({ type: 'step', label: 'Booting sandbox', status: 'done' });
 
-  // 1. Seed source.
+  // 1. Seed source. Always branch the working branch FROM the default.
+  let baseBranch = 'main';
   if (manifest.mode === 'repo') {
     emit({ type: 'step', label: 'Cloning repo', status: 'active' });
     const cloneUrl = cloneUrlFor(manifest.repoUrl ?? '');
@@ -141,9 +143,11 @@ export async function seedProject(
         `git clone failed (exit ${clone.exitCode}).${authy ? ' For a private repo, set GITHUB_TOKEN in .env.' : ''}\n${out}`,
       );
     }
-    await box.exec(`git ${GIT_ID} checkout -b ${shellArg(manifest.branch)}`, {
-      cwd: app,
-    });
+    baseBranch = await detectDefaultBranch(box, app);
+    await box.exec(
+      `git ${GIT_ID} checkout -b ${shellArg(manifest.branch)} ${shellArg(baseBranch)}`,
+      { cwd: app },
+    );
     emit({ type: 'step', label: 'Cloning repo', status: 'done' });
   } else {
     emit({ type: 'step', label: 'Scaffolding app', status: 'active' });
@@ -151,8 +155,10 @@ export async function seedProject(
     for (const [rel, content] of Object.entries(SCRATCH_TEMPLATE)) {
       await box.writeFile(`${app}/${rel}`, content);
     }
+    // Initial commit on main (the base), then branch the working branch off it.
+    baseBranch = 'main';
     await box.exec(
-      `git init -q && git ${GIT_ID} add -A && git ${GIT_ID} commit -q -m "scaffold" && git branch -M ${shellArg(manifest.branch)}`,
+      `git init -q && git ${GIT_ID} add -A && git ${GIT_ID} commit -q -m "chore: scaffold project" && git branch -M main && git checkout -b ${shellArg(manifest.branch)}`,
       { cwd: app },
     );
     emit({ type: 'step', label: 'Scaffolding app', status: 'done' });
@@ -196,6 +202,7 @@ export async function seedProject(
     ...manifest,
     sandboxId: box.id,
     devPort: port,
+    baseBranch,
     previewUrl: await box.previewUrl(port),
     status: up ? 'ready' : 'error',
     error: up
