@@ -1,21 +1,20 @@
 /**
- * GitHub REST helpers for the ship flow. v1 auth is a personal access token
- * (`GITHUB_TOKEN`) with `repo` scope; per-user OAuth comes later.
+ * GitHub REST helpers for the ship flow. Every call takes an explicit access
+ * token — the logged-in user's OAuth token (per-user), or the GITHUB_TOKEN
+ * fallback for local/dev. Resolve it with `getGithubToken(req)` in auth.ts.
  */
 
 const API = 'https://api.github.com';
 
-export function githubToken(): string {
-  const t = process.env.GITHUB_TOKEN;
-  if (!t) throw new Error('GITHUB_TOKEN is not set');
-  return t;
-}
-
-async function gh<T>(path: string, init?: RequestInit): Promise<T> {
+async function gh<T>(
+  path: string,
+  token: string,
+  init?: RequestInit,
+): Promise<T> {
   const res = await fetch(`${API}${path}`, {
     ...init,
     headers: {
-      authorization: `Bearer ${githubToken()}`,
+      authorization: `Bearer ${token}`,
       accept: 'application/vnd.github+json',
       'content-type': 'application/json',
       'x-github-api-version': '2022-11-28',
@@ -37,18 +36,36 @@ export function parseRepo(url: string): { owner: string; repo: string } {
 }
 
 /** Authenticated clone/push URL embedding the token. */
-export function authedRemote(owner: string, repo: string): string {
-  return `https://x-access-token:${githubToken()}@github.com/${owner}/${repo}.git`;
+export function authedRemote(
+  owner: string,
+  repo: string,
+  token: string,
+): string {
+  return `https://x-access-token:${token}@github.com/${owner}/${repo}.git`;
+}
+
+/** The authenticated user's login (for showing "connected as …"). */
+export async function getViewer(token: string): Promise<string> {
+  const r = await gh<{ login: string }>('/user', token);
+  return r.login;
 }
 
 export async function defaultBranch(
   owner: string,
   repo: string,
+  token: string,
 ): Promise<string> {
-  const r = await gh<{ default_branch: string }>(`/repos/${owner}/${repo}`);
+  const r = await gh<{ default_branch: string }>(
+    `/repos/${owner}/${repo}`,
+    token,
+  );
   return r.default_branch;
 }
 
+/**
+ * Open a PR, or return the existing one for the same head→base (GitHub 422s on
+ * a duplicate). Returns its url + number.
+ */
 export async function openPullRequest(opts: {
   owner: string;
   repo: string;
@@ -56,28 +73,70 @@ export async function openPullRequest(opts: {
   base: string;
   title: string;
   body?: string;
-}): Promise<string> {
-  const r = await gh<{ html_url: string }>(
-    `/repos/${opts.owner}/${opts.repo}/pulls`,
-    {
-      method: 'POST',
-      body: JSON.stringify({
-        title: opts.title,
-        head: opts.head,
-        base: opts.base,
-        body: opts.body ?? '',
-      }),
-    },
+  token: string;
+}): Promise<{ url: string; number: number }> {
+  try {
+    const r = await gh<{ html_url: string; number: number }>(
+      `/repos/${opts.owner}/${opts.repo}/pulls`,
+      opts.token,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          title: opts.title,
+          head: opts.head,
+          base: opts.base,
+          body: opts.body ?? '',
+        }),
+      },
+    );
+    return { url: r.html_url, number: r.number };
+  } catch (e) {
+    const existing = await gh<{ html_url: string; number: number }[]>(
+      `/repos/${opts.owner}/${opts.repo}/pulls?head=${opts.owner}:${encodeURIComponent(opts.head)}&state=open`,
+      opts.token,
+    ).catch(() => []);
+    if (existing[0])
+      return { url: existing[0].html_url, number: existing[0].number };
+    throw e;
+  }
+}
+
+/** Current state of a PR: whether it's open/closed and whether it merged. */
+export async function getPullRequestState(
+  owner: string,
+  repo: string,
+  number: number,
+  token: string,
+): Promise<{ state: 'open' | 'closed'; merged: boolean }> {
+  const r = await gh<{ state: 'open' | 'closed'; merged: boolean }>(
+    `/repos/${owner}/${repo}/pulls/${number}`,
+    token,
   );
-  return r.html_url;
+  return { state: r.state, merged: r.merged };
+}
+
+/** Merge a PR (squash by default). */
+export async function mergePullRequest(
+  owner: string,
+  repo: string,
+  number: number,
+  token: string,
+  method: 'squash' | 'merge' | 'rebase' = 'squash',
+): Promise<void> {
+  await gh(`/repos/${owner}/${repo}/pulls/${number}/merge`, token, {
+    method: 'PUT',
+    body: JSON.stringify({ merge_method: method }),
+  });
 }
 
 /** Create a new repo under the authenticated user; returns owner + html_url. */
 export async function createRepo(
   name: string,
+  token: string,
 ): Promise<{ owner: string; htmlUrl: string }> {
   const r = await gh<{ html_url: string; owner: { login: string } }>(
     '/user/repos',
+    token,
     {
       method: 'POST',
       body: JSON.stringify({ name, private: true, auto_init: false }),

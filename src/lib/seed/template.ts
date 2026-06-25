@@ -14,7 +14,7 @@ export const SCRATCH_DEV_PORT = 5173;
 export const SCRATCH_TEMPLATE: Record<string, string> = {
   'package.json': `${JSON.stringify(
     {
-      name: 'weave-app',
+      name: 'aned-app',
       private: true,
       version: '0.0.0',
       type: 'module',
@@ -81,7 +81,7 @@ export default defineConfig({
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Weave App</title>
+    <title>Aned App</title>
   </head>
   <body>
     <div id="root"></div>

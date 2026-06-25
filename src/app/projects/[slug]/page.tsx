@@ -6,6 +6,8 @@ import {
   ChevronRight,
   ChevronsUpDown,
   ExternalLink,
+  GitBranch,
+  GitMerge,
   GitPullRequest,
   ImagePlus,
   Loader2,
@@ -115,7 +117,7 @@ export default function Workspace({
       const ac = new AbortController();
       abortRef.current = ac;
       try {
-        await api.chat(
+        const res = await api.chat(
           slug,
           msg,
           (e) => {
@@ -142,6 +144,7 @@ export default function Workspace({
           },
         );
         setPreviewNonce((n) => n + 1);
+        setManifest(res.manifest); // reflect new repoUrl / prUrl / branch
       } catch (err) {
         if (!ac.signal.aborted) {
           setTurns((t) =>
@@ -242,6 +245,13 @@ export default function Workspace({
   }, [phase, manifest, send]);
 
   const ready = phase === 'ready';
+  const connected = !!manifest?.repoUrl;
+  const refreshManifest = useCallback(() => {
+    api
+      .getProject(slug)
+      .then(setManifest)
+      .catch(() => {});
+  }, [slug]);
 
   // Detect routes once ready and after each edit (new pages may appear).
   const refreshRoutes = useCallback(() => {
@@ -284,9 +294,12 @@ export default function Workspace({
         <header className='flex items-center gap-2 px-4 py-3'>
           <div className='size-6 rounded-md bg-linear-to-br from-violet-500 to-indigo-500' />
           <span className='font-medium tracking-tight'>Aned</span>
-          <span className='truncate text-sm text-muted-foreground'>
-            / {manifest?.name ?? '…'}
-          </span>
+          <span className='text-sm text-muted-foreground'>/</span>
+          <EditableName
+            slug={slug}
+            name={manifest?.name ?? '…'}
+            onRenamed={(m) => setManifest(m)}
+          />
           <div className='ml-auto flex rounded-lg bg-muted/60 p-0.5 text-xs'>
             {(['chat', 'dir'] as const).map((t) => (
               <button
@@ -334,6 +347,13 @@ export default function Workspace({
                   />
                 ))}
                 {busy && !lastTurnHasTools && <Thinking />}
+                {ready && !connected && !busy && turns.length > 0 && (
+                  <ConnectGitHubCard
+                    slug={slug}
+                    defaultName={manifest?.name ?? 'app'}
+                    onConnected={refreshManifest}
+                  />
+                )}
               </div>
             </ScrollArea>
 
@@ -345,6 +365,7 @@ export default function Workspace({
               addFiles={addFiles}
               model={model}
               setModel={setModel}
+              branch={manifest?.branch}
               disabled={!ready}
               busy={busy}
               onSend={() => send(input, attachments)}
@@ -407,7 +428,12 @@ export default function Workspace({
                 </IconBtn>
               </a>
             )}
-            <ShipMenu slug={slug} manifest={manifest} disabled={!ready} />
+            <GitBar
+              slug={slug}
+              manifest={manifest}
+              setManifest={setManifest}
+              ready={ready}
+            />
           </div>
 
           <div className='min-h-0 flex-1 bg-white'>
@@ -450,6 +476,66 @@ export default function Workspace({
 }
 
 /* ── components ───────────────────────────────────────────────── */
+
+function EditableName({
+  slug,
+  name,
+  onRenamed,
+}: {
+  slug: string;
+  name: string;
+  onRenamed: (m: ProjectManifest) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState(name);
+
+  async function save() {
+    setEditing(false);
+    const next = value.trim();
+    if (!next || next === name) {
+      setValue(name);
+      return;
+    }
+    try {
+      onRenamed(await api.renameProject(slug, next));
+    } catch {
+      setValue(name);
+    }
+  }
+
+  if (editing) {
+    return (
+      <input
+        // biome-ignore lint/a11y/noAutofocus: focus the rename field on open
+        autoFocus
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        onBlur={save}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') save();
+          if (e.key === 'Escape') {
+            setValue(name);
+            setEditing(false);
+          }
+        }}
+        className='min-w-0 flex-1 rounded-md border border-border bg-background px-1.5 py-0.5 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring'
+      />
+    );
+  }
+  return (
+    <button
+      type='button'
+      title='Rename project'
+      onClick={() => {
+        setValue(name);
+        setEditing(true);
+      }}
+      className='min-w-0 truncate rounded-md px-1 text-sm text-muted-foreground hover:bg-muted/50 hover:text-foreground'
+    >
+      {name}
+    </button>
+  );
+}
 
 function DesignSystemEmpty({
   busy,
@@ -608,6 +694,7 @@ function Composer({
   addFiles,
   model,
   setModel,
+  branch,
   disabled,
   busy,
   onSend,
@@ -620,6 +707,7 @@ function Composer({
   addFiles: (f: FileList | File[]) => void;
   model: string;
   setModel: (m: string) => void;
+  branch?: string;
   disabled: boolean;
   busy: boolean;
   onSend: () => void;
@@ -630,6 +718,12 @@ function Composer({
 
   return (
     <div className='p-3'>
+      {branch && (
+        <div className='mb-1.5 flex items-center gap-1.5 px-1 text-[11px] text-muted-foreground'>
+          <GitBranch className='size-3' />
+          <span className='truncate font-mono'>{branch}</span>
+        </div>
+      )}
       <div className='rounded-2xl border border-border/70 bg-card p-2 shadow-sm transition-colors focus-within:border-border'>
         {attachments.length > 0 && (
           <div className='flex flex-wrap gap-2 px-1 pt-1 pb-2'>
@@ -944,44 +1038,138 @@ function IconBtn({
   );
 }
 
-function ShipMenu({
+function GitBar({
   slug,
   manifest,
-  disabled,
+  setManifest,
+  ready,
 }: {
   slug: string;
   manifest: ProjectManifest | null;
-  disabled: boolean;
+  setManifest: React.Dispatch<React.SetStateAction<ProjectManifest | null>>;
+  ready: boolean;
 }) {
-  const [busy, setBusy] = useState(false);
-  const [url, setUrl] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [repoName, setRepoName] = useState('');
+  const [mergeBusy, setMergeBusy] = useState(false);
+  const prUrl = manifest?.prUrl;
 
-  const isRepo = manifest?.mode === 'repo';
-
-  // Default the repo name from the project name once known.
-  useEffect(() => {
-    if (manifest && !repoName) {
-      setRepoName(
-        manifest.name
-          .toLowerCase()
-          .replace(/[^a-z0-9]+/g, '-')
-          .replace(/^-+|-+$/g, '') || 'weave-app',
-      );
+  async function merge() {
+    setMergeBusy(true);
+    try {
+      const r = await api.mergePr(slug);
+      if (r.ok)
+        setManifest((m) =>
+          m ? { ...m, prUrl: undefined, prNumber: undefined } : m,
+        );
+    } finally {
+      setMergeBusy(false);
     }
-  }, [manifest, repoName]);
+  }
+  return (
+    <div className='flex items-center gap-1.5'>
+      <span className='flex items-center gap-1.5 rounded-md border border-border/60 px-2 py-1 text-[11px] text-muted-foreground'>
+        <span
+          className={`size-1.5 rounded-full ${ready ? 'bg-emerald-500' : 'bg-muted-foreground/40'}`}
+        />
+        {ready ? 'Ready' : 'Unavailable'}
+      </span>
 
-  async function go() {
+      {/* Connecting GitHub happens via the in-chat card; commits/pushes/PRs are
+          automatic. Once a PR is open, View PR + Merge appear here. */}
+      {prUrl && (
+        <>
+          <a href={prUrl} target='_blank' rel='noreferrer'>
+            <Button
+              size='sm'
+              variant='ghost'
+              className='h-8 gap-1.5 rounded-lg'
+            >
+              <GitPullRequest className='size-4' /> View PR
+            </Button>
+          </a>
+          <Button
+            size='sm'
+            variant='secondary'
+            className='h-8 gap-1.5 rounded-lg'
+            disabled={mergeBusy}
+            onClick={merge}
+          >
+            {mergeBusy ? (
+              <Loader2 className='size-4 animate-spin text-orange-500' />
+            ) : (
+              <GitMerge className='size-4' />
+            )}
+            Merge
+          </Button>
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * In-chat GitHub integration box, shown after a task when no remote is
+ * connected. Creates a private repo, pushes, and opens the first PR — then the
+ * whole git flow (commit/push/PR) is automatic on every later task.
+ */
+function ConnectGitHubCard({
+  slug,
+  defaultName,
+  onConnected,
+}: {
+  slug: string;
+  defaultName: string;
+  onConnected: () => void;
+}) {
+  const [name, setName] = useState(
+    defaultName
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '') || 'app',
+  );
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // GitHub account connection (OAuth) status.
+  const [gh, setGh] = useState<{
+    connected: boolean;
+    login: string | null;
+  } | null>(null);
+  useEffect(() => {
+    api
+      .githubStatus()
+      .then(setGh)
+      .catch(() => setGh({ connected: false, login: null }));
+  }, []);
+
+  function connectAccount() {
+    const next = encodeURIComponent(window.location.pathname);
+    // Open the OAuth flow in a NEW TAB; it notifies us + closes when done.
+    window.open(`/api/auth/github?popup=1&next=${next}`, '_blank');
+    const onMsg = (e: MessageEvent) => {
+      if (e.data === 'weave-github-connected') {
+        window.removeEventListener('message', onMsg);
+        setGh(null);
+        api
+          .githubStatus()
+          .then(setGh)
+          .catch(() => {});
+      } else if (e.data === 'weave-github-error') {
+        window.removeEventListener('message', onMsg);
+      }
+    };
+    window.addEventListener('message', onMsg);
+  }
+
+  async function connect() {
     setBusy(true);
     setError(null);
     try {
-      const r = await api.ship(slug, isRepo ? {} : { repoName });
-      if (r.ok && r.url) {
-        setUrl(r.url);
-        window.open(r.url, '_blank');
+      const r = await api.ship(slug, { repoName: name });
+      if (r.ok) {
+        setDone(true);
+        onConnected();
       } else {
-        setError(r.error ?? 'Ship failed.');
+        setError(r.error ?? 'Connect failed.');
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -990,86 +1178,73 @@ function ShipMenu({
     }
   }
 
-  const repo = isRepo ? parseRepoLabel(manifest?.repoUrl) : null;
+  if (done) {
+    return (
+      <div className='flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-sm'>
+        <Check className='size-4 text-emerald-500' />
+        Connected to GitHub — changes now commit, push & PR automatically.
+      </div>
+    );
+  }
 
   return (
-    <Popover>
-      <PopoverTrigger asChild>
+    <div className='rounded-xl border border-border/70 bg-card/60 p-3'>
+      <div className='flex items-center gap-2'>
+        <GitPullRequest className='size-4 text-muted-foreground' />
+        <p className='text-sm font-medium'>Connect GitHub</p>
+      </div>
+      <p className='mt-1 text-xs leading-relaxed text-muted-foreground'>
+        Your work lives only in this sandbox until you connect a repo. Connect
+        your GitHub and create a private repo — then every task commits, pushes,
+        and opens a PR automatically.
+      </p>
+
+      {gh === null ? (
+        <p className='mt-2.5 flex items-center gap-2 text-xs text-muted-foreground'>
+          <Loader2 className='size-3.5 animate-spin text-orange-500' /> Checking
+          GitHub…
+        </p>
+      ) : !gh.connected ? (
         <Button
           size='sm'
-          className='ml-1 h-8 gap-1.5 rounded-lg'
-          disabled={disabled}
+          className='mt-2.5 gap-1.5 rounded-lg'
+          onClick={connectAccount}
         >
-          <GitPullRequest className='size-4' />
-          Ship
+          <GitPullRequest className='size-4' /> Connect GitHub account
         </Button>
-      </PopoverTrigger>
-      <PopoverContent align='end' className='w-80 p-3'>
-        <p className='text-sm font-medium'>
-          {isRepo ? 'Open a pull request' : 'Create a GitHub repo'}
-        </p>
-        <p className='mt-1 text-xs leading-relaxed text-muted-foreground'>
-          {isRepo ? (
-            <>
-              Commit changes on{' '}
-              <span className='font-mono'>{manifest?.branch}</span> and open a
-              PR
-              {repo ? ` against ${repo}` : ''}.
-            </>
-          ) : (
-            'Create a new private repo on your GitHub and push this project to it.'
+      ) : (
+        <>
+          {gh.login && (
+            <p className='mt-2 text-[11px] text-muted-foreground'>
+              Connected as <span className='text-foreground'>{gh.login}</span>
+            </p>
           )}
-        </p>
-
-        {!isRepo && (
-          <input
-            value={repoName}
-            onChange={(e) => setRepoName(e.target.value)}
-            placeholder='repo-name'
-            className='mt-2.5 w-full rounded-lg border border-border bg-background px-2.5 py-1.5 font-mono text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring'
-          />
-        )}
-
-        {error && <p className='mt-2 text-xs text-destructive'>{error}</p>}
-
-        {url ? (
-          <a
-            href={url}
-            target='_blank'
-            rel='noreferrer'
-            className='mt-2.5 flex items-center gap-1.5 text-sm text-foreground underline underline-offset-2'
-          >
-            <ExternalLink className='size-3.5' />
-            {isRepo ? 'View pull request' : 'View repository'}
-          </a>
-        ) : (
-          <Button
-            size='sm'
-            className='mt-3 w-full gap-1.5 rounded-lg'
-            disabled={busy || (!isRepo && !repoName.trim())}
-            onClick={go}
-          >
-            {busy ? (
-              <Loader2 className='size-4 animate-spin text-orange-500' />
-            ) : (
-              <GitPullRequest className='size-4' />
-            )}
-            {isRepo ? 'Commit & open PR' : 'Create repo & push'}
-          </Button>
-        )}
-
-        <p className='mt-2 text-[11px] text-muted-foreground/60'>
-          Requires a GitHub token (GITHUB_TOKEN) on the server.
-        </p>
-      </PopoverContent>
-    </Popover>
+          <div className='mt-2 flex gap-2'>
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder='repo-name'
+              className='h-9 min-w-0 flex-1 rounded-lg border border-border bg-background px-2.5 font-mono text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring'
+            />
+            <Button
+              size='sm'
+              className='h-9 gap-1.5 rounded-lg'
+              disabled={busy || !name.trim()}
+              onClick={connect}
+            >
+              {busy ? (
+                <Loader2 className='size-4 animate-spin text-orange-500' />
+              ) : (
+                <GitPullRequest className='size-4' />
+              )}
+              Create repo
+            </Button>
+          </div>
+        </>
+      )}
+      {error && <p className='mt-2 text-xs text-destructive'>{error}</p>}
+    </div>
   );
-}
-
-function parseRepoLabel(url?: string): string | null {
-  if (!url) return null;
-  const m = url.match(/github\.com[:/]([^/]+\/[^/]+?)(?:\.git)?\/?$/);
-  return m?.[1] ?? null;
 }
 
 function Directory({ slug, ready }: { slug: string; ready: boolean }) {

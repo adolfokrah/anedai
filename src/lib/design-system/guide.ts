@@ -1,5 +1,5 @@
 /**
- * "Our guide" — the opinionated standard every Weave design system conforms to,
+ * "Our guide" — the opinionated standard every Aned design system conforms to,
  * whether generated greenfield or scanned from a repo. This is the quality bar
  * that makes the output a *better, modern* design system rather than a mirror of
  * whatever the repo happened to have.
@@ -10,7 +10,7 @@
 import { DS_FILE_LAYOUT } from './schema';
 
 /** The standard itself — what a good modern design system must satisfy. */
-export const DESIGN_SYSTEM_GUIDE = `WEAVE DESIGN-SYSTEM STANDARD — every system you build or refine MUST meet this bar:
+export const DESIGN_SYSTEM_GUIDE = `ANED DESIGN-SYSTEM STANDARD — every system you build or refine MUST meet this bar:
 
 TOKENS — three tiers, never skip the middle:
 - Primitive: raw scales (color ramps 50–950, an 8px spacing scale, radii, shadows, font sizes/line-heights). Theme-agnostic. UI never references these directly.
