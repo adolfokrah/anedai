@@ -7,7 +7,6 @@ import {
   ChevronsUpDown,
   ExternalLink,
   GitPullRequest,
-  ImagePlus,
   Loader2,
   Paperclip,
   RefreshCw,
@@ -26,7 +25,7 @@ import {
 import { ScrollArea } from '@/components/ui/scroll-area';
 import * as api from '@/lib/api';
 import { DEFAULT_MODEL, MODELS, modelLabel } from '@/lib/models';
-import type { ProjectManifest, TaskStatus } from '@/lib/types';
+import type { FileNode, ProjectManifest, TaskStatus } from '@/lib/types';
 
 interface SeedStep {
   label: string;
@@ -1072,37 +1071,140 @@ function parseRepoLabel(url?: string): string | null {
   return m?.[1] ?? null;
 }
 
+/** Folders first, then alphabetical — stable ordering for the file tree. */
+function sortNodes(nodes: FileNode[]): FileNode[] {
+  return [...nodes].sort((a, b) =>
+    a.isDir === b.isDir ? a.name.localeCompare(b.name) : a.isDir ? -1 : 1,
+  );
+}
+
 function Directory({ slug, ready }: { slug: string; ready: boolean }) {
-  const [files, setFiles] = useState<string[]>([]);
+  // null = loading; [] = empty; FileNode[] = listed.
+  const [nodes, setNodes] = useState<FileNode[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
   useEffect(() => {
-    if (!ready) return;
+    if (!ready) {
+      setNodes(null);
+      setError(null);
+      return;
+    }
+    let cancelled = false;
+    setNodes(null);
+    setError(null);
     api
       .getFiles(slug)
-      .then((nodes) =>
-        setFiles(nodes.map((n) => (n.isDir ? `${n.name}/` : n.name)).sort()),
-      )
-      .catch(() => setFiles([]));
+      .then((n) => {
+        if (!cancelled) setNodes(sortNodes(n));
+      })
+      .catch((e) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [slug, ready]);
+
   return (
     <ScrollArea className='min-h-0 flex-1'>
-      <div className='p-4'>
-        {files.length ? (
-          files.map((f) => (
-            <div
-              key={f}
-              className='flex items-center gap-2 rounded-md px-2 py-1 font-mono text-xs text-muted-foreground hover:bg-muted/50'
-            >
-              {f.endsWith('/') ? '📁' : '📄'} {f.replace(/\/$/, '')}
-            </div>
+      <div className='p-2'>
+        {!ready ? (
+          <p className='px-2 py-1 text-sm text-muted-foreground'>
+            Sandbox not ready.
+          </p>
+        ) : error ? (
+          <p className='px-2 py-1 text-sm text-muted-foreground'>
+            Couldn’t load files: {error}
+          </p>
+        ) : nodes === null ? (
+          <p className='flex items-center gap-2 px-2 py-1 text-sm text-muted-foreground'>
+            <Loader2 className='size-3.5 animate-spin' /> Loading files…
+          </p>
+        ) : nodes.length ? (
+          nodes.map((n) => (
+            <FileTreeNode key={n.path} slug={slug} node={n} depth={0} />
           ))
         ) : (
-          <p className='flex items-center gap-2 px-2 text-sm text-muted-foreground'>
-            <ImagePlus className='size-4' />
-            {ready ? 'No files.' : 'Sandbox not ready.'}
-          </p>
+          <p className='px-2 py-1 text-sm text-muted-foreground'>No files.</p>
         )}
       </div>
     </ScrollArea>
+  );
+}
+
+/** One row of the file tree. Folders lazily fetch children on first expand. */
+function FileTreeNode({
+  slug,
+  node,
+  depth,
+}: {
+  slug: string;
+  node: FileNode;
+  depth: number;
+}) {
+  const [open, setOpen] = useState(false);
+  const [children, setChildren] = useState<FileNode[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const indent = { paddingLeft: `${depth * 12 + 8}px` };
+
+  if (!node.isDir) {
+    return (
+      <div
+        style={indent}
+        className='flex items-center gap-2 rounded-md py-1 pr-2 font-mono text-xs text-muted-foreground hover:bg-muted/50'
+      >
+        <span className='inline-block size-3.5 shrink-0' />📄{' '}
+        <span className='truncate'>{node.name}</span>
+      </div>
+    );
+  }
+
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    if (next && children === null && !loading) {
+      setLoading(true);
+      api
+        .getFiles(slug, node.path)
+        .then((n) => setChildren(sortNodes(n)))
+        .catch(() => setChildren([]))
+        .finally(() => setLoading(false));
+    }
+  };
+
+  return (
+    <>
+      <button
+        type='button'
+        onClick={toggle}
+        style={indent}
+        className='flex w-full items-center gap-2 rounded-md py-1 pr-2 text-left font-mono text-xs text-foreground hover:bg-muted/50'
+      >
+        <ChevronRight
+          className={`size-3.5 shrink-0 text-muted-foreground transition-transform ${
+            open ? 'rotate-90' : ''
+          }`}
+        />
+        📁 <span className='truncate'>{node.name}</span>
+        {loading && (
+          <Loader2 className='ml-auto size-3 shrink-0 animate-spin text-muted-foreground' />
+        )}
+      </button>
+      {open &&
+        children !== null &&
+        (children.length ? (
+          children.map((c) => (
+            <FileTreeNode key={c.path} slug={slug} node={c} depth={depth + 1} />
+          ))
+        ) : loading ? null : (
+          <div
+            style={{ paddingLeft: `${(depth + 1) * 12 + 8}px` }}
+            className='py-1 font-mono text-xs text-muted-foreground/60'
+          >
+            empty
+          </div>
+        ))}
+    </>
   );
 }
 
