@@ -110,6 +110,13 @@ export async function getSession(req: Request): Promise<SessionData | null> {
   return sid ? readSession(sid) : null;
 }
 
+/** Drop the request's session (delete the server record). Caller clears cookie. */
+export async function deleteSession(req: Request): Promise<void> {
+  const cookies = parseCookies(req.headers.get('cookie'));
+  const sid = unsign(cookies[SESSION_COOKIE]);
+  if (sid) await fs.rm(path.join(DIR, `${sid}.json`), { force: true });
+}
+
 /** GitHub token for this request: the user's OAuth token, else env fallback. */
 export async function getGithubToken(req: Request): Promise<string | null> {
   const session = await getSession(req);

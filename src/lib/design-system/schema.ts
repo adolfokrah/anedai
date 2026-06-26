@@ -167,6 +167,14 @@ export interface DesignSystem {
    */
   componentsDir: string;
   componentsRoots?: string[];
+  /**
+   * The LIVE, in-app docs route that renders this system (what the Design-system
+   * tab serves). Adopted from an existing in-app styleguide/design-system route
+   * when the repo already has one (extended in place); otherwise the created
+   * `${DS_FILE_LAYOUT.route}`. A path on the app's own dev server — NOT Storybook
+   * (separate server/port; harvested as a source, never served here).
+   */
+  route: string;
   primitives: PrimitiveTokens;
   semantic: ThemeSet;
   typography: Typography;

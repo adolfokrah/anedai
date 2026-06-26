@@ -11,11 +11,33 @@ export type Producer = (emit: (e: AgentEvent) => void) => Promise<void>;
 
 export function ndjsonResponse(produce: Producer): Response {
   const encoder = new TextEncoder();
+  // The producer (seed/restart/chat) can run far longer than the client keeps
+  // the connection open. If the client disconnects, the controller closes and
+  // any further enqueue throws — swallow it so the producer finishes (e.g. seed
+  // still completes + persists the manifest) instead of crashing.
+  let closed = false;
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const emit = (e: AgentEvent) => {
-        controller.enqueue(encoder.encode(`${JSON.stringify(e)}\n`));
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode(`${JSON.stringify(e)}\n`));
+        } catch {
+          closed = true; // client gone
+        }
       };
+      // Heartbeat: agent steps (npm install, a compile) can run for a minute+
+      // with no events. Without traffic an idle proxy/connection drops the
+      // stream → the client sees a "network error". A blank line every 10s
+      // keeps it warm; the client's parser ignores empty lines.
+      const heartbeat = setInterval(() => {
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode('\n'));
+        } catch {
+          closed = true;
+        }
+      }, 10_000);
       try {
         await produce(emit);
       } catch (err) {
@@ -24,8 +46,19 @@ export function ndjsonResponse(produce: Producer): Response {
           line: `stream error: ${err instanceof Error ? err.message : String(err)}`,
         });
       } finally {
-        controller.close();
+        clearInterval(heartbeat);
+        if (!closed) {
+          closed = true;
+          try {
+            controller.close();
+          } catch {
+            // already closed
+          }
+        }
       }
+    },
+    cancel() {
+      closed = true; // client disconnected
     },
   });
 
@@ -34,6 +67,8 @@ export function ndjsonResponse(produce: Producer): Response {
       'content-type': 'application/x-ndjson; charset=utf-8',
       'cache-control': 'no-cache, no-transform',
       connection: 'keep-alive',
+      // Disable proxy/dev-server buffering so chunks (and heartbeats) flush.
+      'x-accel-buffering': 'no',
     },
   });
 }

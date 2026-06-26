@@ -1,77 +1,48 @@
 /**
- * Seed a project's sandbox: boot the box, scaffold (scratch) or clone (repo),
- * create the working branch, install deps, start the dev server, and wait until
- * the preview is live. Emits step/log events for the UI's seed progress view.
- *
- * The two entry modes diverge only here; everything after seed (agent edits,
- * preview, ship) is identical.
+ * Boot a project's sandbox. SCRATCH: scaffold our template + install + start dev
+ * (deterministic, instant). REPO: box only — the chat agent clones the repo and
+ * brings it up conversationally (see the workspace's first auto turn).
+ * `restartApp` re-runs bring-up in place for recovery.
  */
 
+import { runStartup } from '@/lib/agent/startup';
+import { writeEnv } from '@/lib/env';
 import { detectDefaultBranch } from '@/lib/git';
 import { runtime } from '@/lib/runtime';
 import type { Box } from '@/lib/runtime/types';
+import { connectBox } from '@/lib/session';
 import { saveProject } from '@/lib/store';
 import type { AgentEvent, ProjectManifest } from '@/lib/types';
 
-import { SCRATCH_DEV_PORT, SCRATCH_TEMPLATE } from './template';
+import { scaffold } from './template';
 
 const GIT_ID = '-c user.email=agent@aned.dev -c user.name=Aned';
 
 type Emit = (e: AgentEvent) => void;
 
-/** The app's working directory inside the sandbox (under the writable home). */
+/**
+ * The repo/git root inside the sandbox (clone/scaffold target). Git operations
+ * (branch, commit, push, pull) always run here, even for monorepos.
+ */
 export async function appDir(box: Box): Promise<string> {
   return `${await box.homeDir()}/app`;
 }
 
-const devLog = (app: string) => `${app}/.weave-dev.log`;
-
-/** Detect package manager + dev command + port for a cloned repo. */
-async function detectRepo(
+/**
+ * The app's working directory — the repo root, or a subdirectory of it for a
+ * monorepo (`manifest.subdir`). Everything app-scoped (bring-up, file tree,
+ * design system, the chat agent's cwd) uses this; git still uses {@link appDir}.
+ */
+export async function workDir(
   box: Box,
-  app: string,
-): Promise<{ install: string; dev: string; port: number }> {
-  let pkg: {
-    dependencies?: Record<string, string>;
-    packageManager?: string;
-    engines?: { pnpm?: string; node?: string };
-  } = {};
-  try {
-    pkg = JSON.parse(await box.readFile(`${app}/package.json`));
-  } catch {
-    // no package.json — fall back to a static server attempt
-  }
-  const hasNext = 'next' in { ...pkg.dependencies };
-  const port = hasNext ? 3000 : SCRATCH_DEV_PORT;
-
-  // Package manager from lockfile.
-  const lock = await box
-    .exec('ls pnpm-lock.yaml yarn.lock package-lock.json 2>/dev/null', {
-      cwd: app,
-    })
-    .then((r) => r.stdout)
-    .catch(() => '');
-  const runner = lock.includes('pnpm-lock')
-    ? 'pnpm'
-    : lock.includes('yarn.lock')
-      ? 'yarn'
-      : 'npm';
-
-  // The sandbox ships node + npm but not pnpm/yarn on PATH. Launch those via
-  // `npx --yes <pm>@<version>` (no global install, no permissions needed) —
-  // pinning the version the repo expects, since `npx pnpm` would otherwise grab
-  // the latest (e.g. 11) and trip engines.pnpm "^9 || ^10". npm runs directly.
-  const spec = runner === 'pnpm' ? `pnpm@${pnpmMajor(pkg)}` : runner;
-  const launch = runner === 'npm' ? 'npm' : `npx --yes ${spec}`;
-  const install = `${launch} install`;
-  const runDev = runner === 'npm' ? 'npm run dev' : `${launch} dev`;
-
-  // Bind to 0.0.0.0 so the port is reachable through the sandbox proxy.
-  const dev = hasNext
-    ? `${runDev} -- -H 0.0.0.0 -p ${port}`
-    : `${runDev} -- --host 0.0.0.0 --port ${port}`;
-  return { install, dev, port };
+  manifest: { subdir?: string },
+): Promise<string> {
+  const root = await appDir(box);
+  const sub = manifest.subdir?.replace(/^\/+|\/+$/g, '');
+  return sub ? `${root}/${sub}` : root;
 }
+
+const devLog = (app: string) => `${app}/.aned-dev.log`;
 
 /**
  * Start the dev server detached (logging to a file), then poll until it answers
@@ -84,12 +55,13 @@ async function startDevAndWait(
   dev: string,
   port: number,
   emit: Emit,
+  env?: Record<string, string>,
 ): Promise<boolean> {
   const log = devLog(app);
   await box.exec(`: > ${log}`, { cwd: app }).catch(() => {});
   // Hand the dev command (with its log redirect) to the runtime's background
   // mode so the server outlives this call. Logs land in the dev log file.
-  await box.exec(`${dev} > ${log} 2>&1`, { cwd: app, background: true });
+  await box.exec(`${dev} > ${log} 2>&1`, { cwd: app, background: true, env });
 
   let shown = 0;
   for (let i = 0; i < 60; i++) {
@@ -114,65 +86,94 @@ async function startDevAndWait(
   return false;
 }
 
+/** Poll until the dev server (already started, e.g. by the agent) answers. */
+async function waitForDev(
+  box: Box,
+  port: number,
+  emit: Emit,
+): Promise<boolean> {
+  for (let i = 0; i < 40; i++) {
+    const r = await box
+      .exec(
+        `curl -s -o /dev/null -w "%{http_code}" http://localhost:${port} || true`,
+        { timeoutMs: 8000 },
+      )
+      .catch(() => ({ stdout: '', stderr: '', exitCode: 1 }));
+    if (/^[23]\d\d$/.test(r.stdout.trim())) return true;
+    await sleep(1500);
+  }
+  emit({ type: 'log', line: `dev server did not respond on :${port}` });
+  return false;
+}
+
 export async function seedProject(
   manifest: ProjectManifest,
   emit: Emit,
+  token?: string,
 ): Promise<ProjectManifest> {
   emit({ type: 'step', label: 'Booting sandbox', status: 'active' });
   const box = await runtime.create();
   const home = await box.homeDir();
   const app = `${home}/app`;
+  // Persist the sandbox id IMMEDIATELY — if a later step throws, the manifest
+  // still points at this box so Retry reconnects + re-runs bring-up (the agent
+  // fixes it) instead of orphaning it and creating a new one.
+  await saveProject({ ...manifest, sandboxId: box.id, status: 'seeding' });
   emit({ type: 'step', label: 'Booting sandbox', status: 'done' });
 
-  // 1. Seed source. Always branch the working branch FROM the default.
-  let baseBranch = 'main';
+  // REPO: Aned does the one-time CLONE (token-authed, big-repo friendly), sets
+  // the committer identity, then HANDS OFF. The chat agent owns everything else:
+  // install, run, build, fix, and ALL git (pull, branch, commit, push, PR) — so
+  // it keeps the token in its env and origin stays authed for pushing.
   if (manifest.mode === 'repo') {
     emit({ type: 'step', label: 'Cloning repo', status: 'active' });
-    const cloneUrl = cloneUrlFor(manifest.repoUrl ?? '');
+    const cloneUrl = cloneUrlFor(manifest.repoUrl ?? '', token);
     const clone = await box.execStream(
       `git clone --depth 1 ${shellArg(cloneUrl)} app`,
       (line) => emit({ type: 'log', line }),
-      // GIT_TERMINAL_PROMPT=0 → fail fast on auth instead of hanging on a
-      // username prompt (no tty in the sandbox) until the timeout aborts.
-      { cwd: home, timeoutMs: 180_000, env: { GIT_TERMINAL_PROMPT: '0' } },
+      { cwd: home, timeoutMs: 300_000, env: { GIT_TERMINAL_PROMPT: '0' } },
     );
     if (clone.exitCode !== 0) {
       const out = `${clone.stdout}\n${clone.stderr}`.trim();
       const authy = /authentication|denied|not found|could not read/i.test(out);
       throw new Error(
-        `git clone failed (exit ${clone.exitCode}).${authy ? ' For a private repo, set GITHUB_TOKEN in .env.' : ''}\n${out}`,
+        `git clone failed (exit ${clone.exitCode}).${authy ? ' For a private repo, connect GitHub or set GITHUB_TOKEN.' : ''}\n${out}`,
       );
     }
-    baseBranch = await detectDefaultBranch(box, app);
-    await box.exec(
-      `git ${GIT_ID} checkout -b ${shellArg(manifest.branch)} ${shellArg(baseBranch)}`,
-      { cwd: app },
-    );
+    await box
+      .exec(
+        'git config user.email agent@aned.dev && git config user.name Aned',
+        { cwd: app },
+      )
+      .catch(() => {});
+    const baseBranch = await detectDefaultBranch(box, app);
     emit({ type: 'step', label: 'Cloning repo', status: 'done' });
-  } else {
-    emit({ type: 'step', label: 'Scaffolding app', status: 'active' });
-    await box.exec(`mkdir -p ${app}`);
-    for (const [rel, content] of Object.entries(SCRATCH_TEMPLATE)) {
-      await box.writeFile(`${app}/${rel}`, content);
-    }
-    // Initial commit on main (the base), then branch the working branch off it.
-    baseBranch = 'main';
-    await box.exec(
-      `git init -q && git ${GIT_ID} add -A && git ${GIT_ID} commit -q -m "chore: scaffold project" && git branch -M main && git checkout -b ${shellArg(manifest.branch)}`,
-      { cwd: app },
-    );
-    emit({ type: 'step', label: 'Scaffolding app', status: 'done' });
+    return await saveProject({
+      ...manifest,
+      sandboxId: box.id,
+      status: 'ready',
+      baseBranch,
+      error: undefined,
+    });
   }
 
-  // 2. Install + detect dev command.
-  const { install, dev, port } =
-    manifest.mode === 'repo'
-      ? await detectRepo(box, app)
-      : { install: 'npm install', dev: 'npm run dev', port: SCRATCH_DEV_PORT };
+  // SCRATCH: our own template — deterministic scaffold + install + dev (instant
+  // and reliable; nothing to clone). 'website' → Next.js; 'app' → Vite+TanStack.
+  emit({ type: 'step', label: 'Scaffolding app', status: 'active' });
+  await box.exec(`mkdir -p ${app}`);
+  const sc = scaffold(manifest.kind ?? 'website');
+  for (const [rel, content] of Object.entries(sc.files)) {
+    await box.writeFile(`${app}/${rel}`, content);
+  }
+  await box.exec(
+    `git init -q && git ${GIT_ID} add -A && git ${GIT_ID} commit -q -m "chore: scaffold project" && git branch -M main`,
+    { cwd: app },
+  );
+  emit({ type: 'step', label: 'Scaffolding app', status: 'done' });
 
   emit({ type: 'step', label: 'Installing dependencies', status: 'active' });
   const inst = await box.execStream(
-    install,
+    'npm install',
     (line) => emit({ type: 'log', line }),
     { cwd: app, timeoutMs: 600_000 },
   );
@@ -180,9 +181,14 @@ export async function seedProject(
     throw new Error(`dependency install failed (exit ${inst.exitCode})`);
   emit({ type: 'step', label: 'Installing dependencies', status: 'done' });
 
-  // 3. Start dev server (detached) + wait for it.
+  const port = sc.devPort;
+  // Next dev needs the proxy host in allowedDevOrigins.
+  const devEnv = sc.needsPreviewHost
+    ? { PREVIEW_HOST: new URL(await box.previewUrl(port)).host }
+    : undefined;
+
   emit({ type: 'step', label: 'Starting dev server', status: 'active' });
-  const up = await startDevAndWait(box, app, dev, port, emit);
+  const up = await startDevAndWait(box, app, 'npm run dev', port, emit, devEnv);
   emit({
     type: 'step',
     label: 'Starting dev server',
@@ -197,12 +203,11 @@ export async function seedProject(
         .join('\n')
         .trim();
 
-  // 4. Persist.
   const updated: ProjectManifest = {
     ...manifest,
     sandboxId: box.id,
     devPort: port,
-    baseBranch,
+    baseBranch: 'main',
     previewUrl: await box.previewUrl(port),
     status: up ? 'ready' : 'error',
     error: up
@@ -214,34 +219,110 @@ export async function seedProject(
 }
 
 /**
- * Embed GITHUB_TOKEN into a GitHub https URL so private repos clone without an
- * interactive credential prompt. Non-GitHub or token-less URLs pass through.
+ * Restart an existing project's dev server(s) IN PLACE — reconnect to the
+ * sandbox (resuming it if idle-stopped) and re-run bring-up, WITHOUT recloning
+ * or rescaffolding. Used when the box is still alive but the dev process died
+ * (e.g. after an idle stop); preserves all files, including uncommitted work in
+ * scratch projects. Throws if the sandbox is truly gone (caller re-seeds).
  */
-function cloneUrlFor(url: string): string {
-  const token = process.env.GITHUB_TOKEN;
-  if (!token) return url;
-  const m = url.match(/^https:\/\/github\.com\/(.+)$/);
-  return m ? `https://x-access-token:${token}@github.com/${m[1]}` : url;
-}
+export async function restartApp(
+  manifest: ProjectManifest,
+  emit: Emit,
+): Promise<ProjectManifest> {
+  const box = await connectBox(manifest); // throws if the sandbox is gone
+  const home = await box.homeDir();
+  const app = `${home}/app`;
+  const work = await workDir(box, manifest);
 
-/**
- * Pick a pnpm version the repo accepts. Prefer the exact `packageManager`
- * pin; else the highest major named in `engines.pnpm`; else a safe modern
- * default. Returned as a version/tag for `pnpm@<x>`.
- */
-function pnpmMajor(pkg: {
-  packageManager?: string;
-  engines?: { pnpm?: string };
-}): string {
-  const pm = pkg.packageManager;
-  if (pm?.startsWith('pnpm@'))
-    return pm.slice('pnpm@'.length).split('+')[0] ?? '10';
-  const eng = pkg.engines?.pnpm;
-  if (eng) {
-    const majors = [...eng.matchAll(/(\d+)/g)].map((m) => Number(m[1]));
-    if (majors.length) return String(Math.max(...majors));
+  // Re-write the user's env (gitignored) in case the box was reset.
+  if (manifest.env && Object.keys(manifest.env).length) {
+    await writeEnv(box, work, app, manifest.env).catch(() => {});
   }
-  return '10';
+
+  let port: number;
+  let up: boolean;
+  let docsPort: number | undefined;
+  let docsPreviewUrl: string | undefined;
+  let secretsManager: string | undefined;
+  const missingEnv = new Set<string>();
+
+  if (manifest.mode === 'repo') {
+    emit({ type: 'step', label: 'Starting app', status: 'active' });
+    const appStart = await runStartup(box, work, emit, {
+      hasSubdir: true, // Aned resolved the app dir; agent must NOT hunt for it
+      startCmd: manifest.startCmd,
+      env: manifest.env,
+    });
+    port = appStart.port;
+    for (const k of appStart.missingEnv) missingEnv.add(k);
+    secretsManager = appStart.secretsManager;
+    up = await waitForDev(box, port, emit);
+    emit({
+      type: 'step',
+      label: 'Starting app',
+      status: up ? 'done' : 'error',
+    });
+
+    if (up && manifest.docsStartCmd) {
+      emit({ type: 'step', label: 'Starting docs', status: 'active' });
+      const docsDir = await workDir(box, { subdir: manifest.docsSubdir });
+      const docsStart = await runStartup(box, docsDir, emit, {
+        startCmd: manifest.docsStartCmd,
+        port: 6006,
+        kind: 'docs',
+        logFile: '.aned-docs.log',
+        hasSubdir: !!manifest.docsSubdir,
+        env: manifest.env,
+      });
+      docsPort = docsStart.port;
+      for (const k of docsStart.missingEnv) missingEnv.add(k);
+      const docsUp = await waitForDev(box, docsPort, emit);
+      if (docsUp) docsPreviewUrl = await box.previewUrl(docsPort);
+      emit({
+        type: 'step',
+        label: 'Starting docs',
+        status: docsUp ? 'done' : 'error',
+      });
+    }
+  } else {
+    const sc = scaffold(manifest.kind ?? 'website');
+    port = sc.devPort;
+    const devEnv = sc.needsPreviewHost
+      ? { PREVIEW_HOST: new URL(await box.previewUrl(port)).host }
+      : undefined;
+    emit({ type: 'step', label: 'Starting dev server', status: 'active' });
+    up = await startDevAndWait(box, app, 'npm run dev', port, emit, devEnv);
+    emit({
+      type: 'step',
+      label: 'Starting dev server',
+      status: up ? 'done' : 'error',
+    });
+  }
+
+  const tail = up
+    ? ''
+    : (await box.readFile(devLog(app)).catch(() => ''))
+        .split('\n')
+        .slice(-25)
+        .join('\n')
+        .trim();
+
+  const updated: ProjectManifest = {
+    ...manifest,
+    sandboxId: box.id,
+    devPort: port,
+    docsPort,
+    docsPreviewUrl,
+    missingEnv: missingEnv.size ? [...missingEnv] : undefined,
+    secretsManager,
+    previewUrl: await box.previewUrl(port),
+    status: up ? 'ready' : 'error',
+    error: up
+      ? undefined
+      : `dev server didn't restart on :${port}.\n${tail || 'no output'}`,
+  };
+  await saveProject(updated);
+  return updated;
 }
 
 function sleep(ms: number) {
@@ -251,4 +332,16 @@ function sleep(ms: number) {
 /** Shell-escape a single argument. */
 function shellArg(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Embed the token into a GitHub https URL so the clone (and the agent's pushes
+ * via origin) authenticate without an interactive prompt. Non-GitHub or
+ * token-less URLs pass through.
+ */
+function cloneUrlFor(url: string, token?: string): string {
+  const tok = token ?? process.env.GITHUB_TOKEN;
+  if (!tok) return url;
+  const m = url.match(/^https:\/\/github\.com\/(.+)$/);
+  return m ? `https://x-access-token:${tok}@github.com/${m[1]}` : url;
 }

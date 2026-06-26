@@ -1,12 +1,16 @@
 import { type ChatImage, runProjectChat } from '@/lib/agent/run';
+import { runProjectChatAISDK } from '@/lib/agents';
+import { resolveAnedConfig } from '@/lib/aned-config';
 import { getGithubToken } from '@/lib/auth';
-import { commitAll, ensureBranch, pullBase, push } from '@/lib/git';
-import { getPullRequestState, openPullRequest, parseRepo } from '@/lib/github';
+import { DS_FILE_LAYOUT } from '@/lib/design-system';
+import { authedRemote, findOpenPullRequest, parseRepo } from '@/lib/github';
+import { ensureRouteReporter } from '@/lib/route-reporter';
 import type { Box } from '@/lib/runtime/types';
-import { appDir } from '@/lib/seed';
+import { appDir, workDir } from '@/lib/seed';
 import { connectBox } from '@/lib/session';
 import { getProject, updateProject } from '@/lib/store';
 import { ndjsonResponse } from '@/lib/stream';
+import { captureThumb } from '@/lib/thumb';
 import type { ProjectManifest } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
@@ -16,6 +20,13 @@ interface ChatBody {
   message: string;
   model?: string;
   images?: ChatImage[];
+  viewing?: string;
+  mode?: 'build' | 'plan';
+  skill?: string;
+}
+
+function shellArg(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
 export async function POST(
@@ -30,7 +41,7 @@ export async function POST(
       headers: { 'content-type': 'application/json' },
     });
   }
-  let manifest: ProjectManifest = loaded;
+  const manifest: ProjectManifest = loaded;
   const body = (await req.json().catch(() => ({}))) as ChatBody;
   if (!body.message?.trim()) {
     return new Response(JSON.stringify({ error: 'message required' }), {
@@ -43,7 +54,7 @@ export async function POST(
   const abortController = new AbortController();
   req.signal.addEventListener('abort', () => abortController.abort());
 
-  // GitHub token for auto push/PR (the connected user's, or env fallback).
+  // The connected user's GitHub token (or env fallback) — the agent uses it.
   const ghToken = await getGithubToken(req);
 
   return ndjsonResponse(async (emit) => {
@@ -56,106 +67,129 @@ export async function POST(
       return;
     }
 
-    // If the recorded PR was merged/closed (e.g. merged on GitHub), this
-    // session is done — start a FRESH branch off the updated base so new work
-    // isn't stuck on a merged branch with no PR.
-    if (manifest.repoUrl && ghToken && manifest.prNumber) {
-      try {
-        const { owner, repo } = parseRepo(manifest.repoUrl);
-        const st = await getPullRequestState(
-          owner,
-          repo,
-          manifest.prNumber,
-          ghToken,
-        );
-        if (st.merged || st.state === 'closed') {
-          const app = await appDir(box);
-          const base = manifest.baseBranch ?? 'main';
-          await pullBase(box, app, base, manifest.repoUrl, ghToken);
-          const n = (manifest.sessionN ?? 1) + 1;
-          const branch = `aned/${slug}-${n}`;
-          await ensureBranch(box, app, branch, base);
-          manifest = await updateProject(slug, {
-            branch,
-            sessionN: n,
-            prUrl: undefined,
-            prNumber: undefined,
-          });
-          emit({
-            type: 'log',
-            line: `previous PR ${st.merged ? 'merged' : 'closed'} — started ${branch}`,
-          });
-        }
-      } catch {
-        // best-effort; fall through
-      }
-    }
+    const app = await appDir(box);
 
-    // Guard: never edit on the base branch. Ensure we're on the working
-    // branch (created off base if missing) BEFORE the agent touches files.
+    // Preconfigure the sandbox so the AGENT can do git itself: committer
+    // identity + an authenticated `origin` (token embedded). `gh` reads
+    // GH_TOKEN, injected into the agent's run_cmd env (see runProjectChat).
     try {
-      const app = await appDir(box);
-      await ensureBranch(
-        box,
-        app,
-        manifest.branch,
-        manifest.baseBranch ?? 'main',
-      );
-    } catch (err) {
-      emit({
-        type: 'log',
-        line: `git: ${err instanceof Error ? err.message : String(err)}`,
-      });
+      let setup =
+        'git config user.email agent@aned.dev && git config user.name Aned';
+      if (manifest.repoUrl && ghToken) {
+        const { owner, repo } = parseRepo(manifest.repoUrl);
+        const remote = authedRemote(owner, repo, ghToken);
+        setup += ` && (git remote set-url origin ${shellArg(remote)} || git remote add origin ${shellArg(remote)})`;
+      }
+      await box.exec(setup, { cwd: app });
+    } catch {
+      // best-effort
     }
 
-    const result = await runProjectChat(box, manifest, body.message, emit, {
+    const planning = body.mode === 'plan';
+    // Agent engine: AI SDK (multi-provider) when AGENT_ENGINE=aisdk, else the
+    // claude-agent-sdk path. Same signature + event stream, so the flag is the
+    // only difference the route sees.
+    const engine =
+      process.env.AGENT_ENGINE === 'aisdk'
+        ? runProjectChatAISDK
+        : runProjectChat;
+    const result = await engine(box, manifest, body.message, emit, {
       resume: manifest.sessionId,
       model: body.model,
       images: body.images,
+      viewing: body.viewing,
+      skill: body.skill,
+      githubToken: ghToken ?? undefined,
       abortController,
+      mode: body.mode,
     });
 
     let updated = result.sessionId
       ? await updateProject(slug, { sessionId: result.sessionId })
       : manifest;
 
-    // After a successful task: commit to the working branch; push if there's a
-    // remote. Best-effort — never fail the turn on a git hiccup.
-    if (result.ok) {
+    // The AGENT owns git (branch/commit/push/PR). Aned only DISCOVERS the
+    // result so the toolbar can show View PR / Merge: record the current branch
+    // and look up the open PR the agent opened (read-only — Aned doesn't push or
+    // open PRs itself).
+    if (result.ok && !planning) {
       try {
-        const app = await appDir(box);
-        // Conventional Commit subject from the agent (fallback to chore:).
-        const subject = conventional(result.summary, body.message);
-        const committed = await commitAll(box, app, subject);
-        if (committed && updated.repoUrl && ghToken) {
-          await push(box, app, updated.branch, updated.repoUrl, ghToken);
-          emit({ type: 'log', line: `pushed ${updated.branch}` });
-        } else if (committed) {
-          emit({ type: 'log', line: `committed to ${updated.branch}` });
+        const base = manifest.baseBranch ?? 'main';
+        const cur = (
+          await box.exec('git branch --show-current', { cwd: app })
+        ).stdout.trim();
+        const patch: Partial<ProjectManifest> = {};
+        if (cur && cur !== base) patch.branch = cur;
+
+        if (manifest.repoUrl && ghToken && cur && cur !== base) {
+          const { owner, repo } = parseRepo(manifest.repoUrl);
+          const pr = await findOpenPullRequest(owner, repo, cur, ghToken).catch(
+            () => null,
+          );
+          if (pr) {
+            patch.prUrl = pr.url;
+            patch.prNumber = pr.number;
+          }
         }
-        // Auto-open a PR once connected, so View PR / Merge appear without a
-        // manual Ship. Reuses the open one if it already exists.
-        if (updated.repoUrl && ghToken && !updated.prNumber) {
-          const { owner, repo } = parseRepo(updated.repoUrl);
-          const pr = await openPullRequest({
-            owner,
-            repo,
-            head: updated.branch,
-            base: updated.baseBranch ?? 'main',
-            title: subject,
-            body: 'Changes generated in an Aned sandbox.',
-            token: ghToken,
-          });
-          await updateProject(slug, { prUrl: pr.url, prNumber: pr.number });
-          emit({ type: 'log', line: 'opened pull request' });
-        }
-      } catch (err) {
-        emit({
-          type: 'log',
-          line: `git: ${err instanceof Error ? err.message : String(err)}`,
-        });
+        if (Object.keys(patch).length)
+          updated = await updateProject(slug, patch);
+      } catch {
+        // best-effort
       }
-      updated = (await getProject(slug)) ?? updated;
+
+      // design-system.json records the in-app DS route (same-server case).
+      try {
+        const work = await workDir(box, manifest);
+        const raw = await box
+          .readFile(`${work}/${DS_FILE_LAYOUT.manifest}`)
+          .catch(() => '');
+        const route = raw ? (JSON.parse(raw) as { route?: string }).route : '';
+        if (route && route !== updated.designRoute)
+          updated = await updateProject(slug, { designRoute: route });
+      } catch {
+        // no design system yet, or unparseable — ignore
+      }
+
+      // anedai.json is the authoritative runtime wiring: which server (port +
+      // route) backs the Pages tab vs a SEPARATE design-system/docs server.
+      // Resolve it to public URLs and persist so the tabs hit the right ports.
+      try {
+        const work = await workDir(box, manifest);
+        const r = await resolveAnedConfig(box, work);
+        const patch: Partial<ProjectManifest> = {};
+        if (r.previewUrl && r.previewUrl !== updated.previewUrl)
+          patch.previewUrl = r.previewUrl;
+        if (r.devPort && r.devPort !== updated.devPort)
+          patch.devPort = r.devPort;
+        if (r.docsPreviewUrl && r.docsPreviewUrl !== updated.docsPreviewUrl)
+          patch.docsPreviewUrl = r.docsPreviewUrl;
+        if (r.docsPort && r.docsPort !== updated.docsPort)
+          patch.docsPort = r.docsPort;
+        if (r.backendUrl && r.backendUrl !== updated.backendUrl)
+          patch.backendUrl = r.backendUrl;
+        if (r.backendPort && r.backendPort !== updated.backendPort)
+          patch.backendPort = r.backendPort;
+        if (Object.keys(patch).length)
+          updated = await updateProject(slug, patch);
+      } catch {
+        // no anedai.json yet — the live start_app wiring still applies
+      }
+
+      // Once the app is running, inject the dev-only route reporter so the
+      // workspace address bar tracks the live page (cross-origin iframes can't
+      // be read directly). One-time, idempotent, kept out of git, best-effort.
+      if (updated.previewUrl && !updated.routeReporter) {
+        try {
+          const r = await ensureRouteReporter(box, app);
+          if (r.injected || r.already)
+            updated = await updateProject(slug, { routeReporter: true });
+        } catch {
+          // best-effort — manual address-bar navigation still works
+        }
+      }
+
+      // Refresh the project thumbnail to reflect the new UI (best-effort).
+      void captureThumb(slug, updated.previewUrl);
     }
 
     emit({
@@ -166,13 +200,4 @@ export async function POST(
       error: result.error,
     });
   });
-}
-
-const CONVENTIONAL =
-  /^(feat|fix|chore|refactor|docs|style|test|perf|build|ci)(\(.+?\))?!?:\s+.+/i;
-
-/** Agent's conventional subject, else a chore: fallback from the request. */
-function conventional(summary: string | undefined, message: string): string {
-  if (summary && CONVENTIONAL.test(summary)) return summary.slice(0, 72);
-  return `chore: ${message.trim().slice(0, 60)}`;
 }

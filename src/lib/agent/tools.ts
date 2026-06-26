@@ -17,11 +17,48 @@ function text(s: string, isError = false) {
   return { content: [{ type: 'text' as const, text: body }], isError };
 }
 
+export interface SandboxToolOpts {
+  /** Env injected into run_cmd (e.g. GH_TOKEN for git/gh). */
+  env?: Record<string, string>;
+  /** Include the `start_app` tool (bring-up runner only). */
+  includeStartApp?: boolean;
+  /**
+   * Called with the port the agent launched a server on. role 'docs' = a
+   * separate design-system/docs server (→ docsPreviewUrl); 'backend' = an API
+   * server (→ backendUrl, no tab); else the main app.
+   */
+  onStartApp?: (port: number, role?: 'app' | 'docs' | 'backend') => void;
+  /** Log file (relative to app) start_app redirects to. Default .aned-dev.log. */
+  logFile?: string;
+  /** Called when the agent asks the user structured questions (renders a form). */
+  onAsk?: (questions: AskQuestionInput[]) => void;
+}
+
+export interface AskQuestionInput {
+  id: string;
+  question: string;
+  options: string[];
+  allowOther?: boolean;
+  multi?: boolean;
+  long?: boolean;
+}
+
 /**
  * Build the MCP server (and its allowed tool names) bound to one sandbox.
  * `app` is the absolute app directory; agent paths are resolved relative to it.
  */
-export function sandboxTools(box: Box, app: string) {
+export function sandboxTools(
+  box: Box,
+  app: string,
+  opts: SandboxToolOpts = {},
+) {
+  const {
+    env,
+    includeStartApp,
+    onStartApp,
+    onAsk,
+    logFile = '.aned-dev.log',
+  } = opts;
   const abs = (p: string) =>
     `${app}/${p.replace(/^\.\//, '').replace(/^\/+/, '')}`;
 
@@ -108,10 +145,10 @@ export function sandboxTools(box: Box, app: string) {
       ),
       tool(
         'run_cmd',
-        'Run a shell command in the app directory (e.g. install a package, run a build). Avoid starting long-lived servers.',
+        'Run a shell command in the app directory (e.g. clone a repo, install deps, run a build). Avoid starting long-lived servers (use start_app). Long ops like clone/install are fine — up to ~5 min.',
         { cmd: z.string() },
         async ({ cmd }) => {
-          const r = await box.exec(cmd, { cwd: app, timeoutMs: 120_000 });
+          const r = await box.exec(cmd, { cwd: app, timeoutMs: 300_000, env });
           const out = [r.stdout, r.stderr].filter(Boolean).join('\n');
           return text(`exit ${r.exitCode}\n${out}`, r.exitCode !== 0);
         },
@@ -138,6 +175,71 @@ export function sandboxTools(box: Box, app: string) {
           }
         },
       ),
+      tool(
+        'ask_user',
+        'Ask the user clarifying questions to gather their preferences/decisions before proceeding (e.g. design direction, theme, content choices). Each question shows selectable options plus an optional free-text "other". Calling this PRESENTS a form and ENDS your turn — the user picks answers and you continue on the NEXT turn. Use 2–5 focused questions; provide your recommended option first. Set `long: true` when the free-text answer is expected to be a paragraph or more (e.g. business description, copy, a brief) so the form shows a textarea instead of a single-line input.',
+        {
+          questions: z.array(
+            z.object({
+              id: z.string(),
+              question: z.string(),
+              options: z.array(z.string()),
+              allowOther: z.boolean().optional(),
+              multi: z.boolean().optional(),
+              long: z.boolean().optional(),
+            }),
+          ),
+        },
+        async ({ questions }) => {
+          onAsk?.(questions);
+          return text(
+            "Questions presented to the user. STOP now — do not call more tools or build anything. Wait for the user's reply (it arrives as the next message).",
+          );
+        },
+      ),
+      ...(includeStartApp
+        ? [
+            tool(
+              'start_app',
+              "Start a server DETACHED so it keeps running. Use this (not run_cmd &) to launch a server. Pass the command, the port, and role: 'app' = main project (default, Pages tab); 'docs' = a separate design-system/docs/Storybook server (DS tab); 'backend' = a separate API/backend server (no tab — point the frontend at the returned URL). Returns the public preview URL — record it in anedai.json.",
+              {
+                command: z.string(),
+                port: z.number(),
+                role: z.enum(['app', 'docs', 'backend']).optional(),
+              },
+              async ({ command, port, role }) => {
+                try {
+                  const log =
+                    role === 'docs'
+                      ? '.aned-docs.log'
+                      : role === 'backend'
+                        ? '.aned-backend.log'
+                        : logFile;
+                  // Detached launch (provider-backed) + log to a file the agent
+                  // can tail with run_cmd to diagnose failures.
+                  await box.exec(`${command} > ${app}/${log} 2>&1`, {
+                    cwd: app,
+                    background: true,
+                    env,
+                  });
+                  onStartApp?.(port, role ?? 'app');
+                  const url = await box.previewUrl(port).catch(() => null);
+                  const tag =
+                    role === 'docs'
+                      ? ' (docs/design-system server)'
+                      : role === 'backend'
+                        ? ' (backend/API server — point the frontend at this URL)'
+                        : '';
+                  return text(
+                    `started on :${port}${url ? ` → ${url}` : ''}${tag} (logs: ${log}). Verify: curl -s -o /dev/null -w "%{http_code}" http://localhost:${port}. Record this full URL in anedai.json.`,
+                  );
+                } catch (e) {
+                  return text(`start failed: ${msg(e)}`, true);
+                }
+              },
+            ),
+          ]
+        : []),
     ],
   });
 
@@ -149,6 +251,8 @@ export function sandboxTools(box: Box, app: string) {
     'mcp__sandbox__grep',
     'mcp__sandbox__run_cmd',
     'mcp__sandbox__web_fetch',
+    'mcp__sandbox__ask_user',
+    ...(includeStartApp ? ['mcp__sandbox__start_app'] : []),
   ];
 
   return { server, allowedTools };

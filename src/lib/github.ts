@@ -50,6 +50,23 @@ export async function getViewer(token: string): Promise<string> {
   return r.login;
 }
 
+/** The user's repos (most recently pushed first), for the connect-a-repo picker. */
+export async function listRepos(
+  token: string,
+): Promise<{ fullName: string; cloneUrl: string; private: boolean }[]> {
+  const r = await gh<
+    { full_name: string; clone_url: string; private: boolean }[]
+  >(
+    '/user/repos?per_page=100&sort=pushed&affiliation=owner,collaborator,organization_member',
+    token,
+  );
+  return r.map((x) => ({
+    fullName: x.full_name,
+    cloneUrl: x.clone_url,
+    private: x.private,
+  }));
+}
+
 export async function defaultBranch(
   owner: string,
   repo: string,
@@ -99,6 +116,20 @@ export async function openPullRequest(opts: {
       return { url: existing[0].html_url, number: existing[0].number };
     throw e;
   }
+}
+
+/** Find the open PR for a head branch, if any (agent may have opened it). */
+export async function findOpenPullRequest(
+  owner: string,
+  repo: string,
+  head: string,
+  token: string,
+): Promise<{ url: string; number: number } | null> {
+  const list = await gh<{ html_url: string; number: number }[]>(
+    `/repos/${owner}/${repo}/pulls?head=${owner}:${encodeURIComponent(head)}&state=open`,
+    token,
+  ).catch(() => []);
+  return list[0] ? { url: list[0].html_url, number: list[0].number } : null;
 }
 
 /** Current state of a PR: whether it's open/closed and whether it merged. */

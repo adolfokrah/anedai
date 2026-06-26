@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 
 import { getGithubToken } from '@/lib/auth';
-import { ensureBranch, pullBase } from '@/lib/git';
+import { pullBase } from '@/lib/git';
 import { appDir } from '@/lib/seed';
 import { connectBox } from '@/lib/session';
 import { getProject, updateProject } from '@/lib/store';
@@ -9,7 +9,7 @@ import { getProject, updateProject } from '@/lib/store';
 export const dynamic = 'force-dynamic';
 export const maxDuration = 120;
 
-/** End the current session: branch a fresh working branch off the updated base. */
+/** End the session: drop the branch so the next task names a fresh one. */
 export async function POST(
   req: Request,
   { params }: { params: Promise<{ slug: string }> },
@@ -21,25 +21,19 @@ export async function POST(
   }
 
   try {
-    const box = await connectBox(manifest);
-    const app = await appDir(box);
     const base = manifest.baseBranch ?? 'main';
-
     const token = await getGithubToken(req);
-    if (manifest.repoUrl && token)
+    if (manifest.repoUrl && token) {
+      const box = await connectBox(manifest);
+      const app = await appDir(box);
       await pullBase(box, app, base, manifest.repoUrl, token);
-
-    const n = (manifest.sessionN ?? 1) + 1;
-    const branch = `aned/${slug}-${n}`;
-    await ensureBranch(box, app, branch, base);
-
+    }
     const updated = await updateProject(slug, {
-      branch,
-      sessionN: n,
+      branch: '',
       prUrl: undefined,
       prNumber: undefined,
     });
-    return NextResponse.json({ ok: true, branch, manifest: updated });
+    return NextResponse.json({ ok: true, manifest: updated });
   } catch (err) {
     return NextResponse.json(
       { ok: false, error: err instanceof Error ? err.message : String(err) },

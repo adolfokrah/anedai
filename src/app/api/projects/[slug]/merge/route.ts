@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 
 import { getGithubToken } from '@/lib/auth';
-import { ensureBranch, pullBase } from '@/lib/git';
+import { pullBase } from '@/lib/git';
 import { mergePullRequest, parseRepo } from '@/lib/github';
 import { appDir } from '@/lib/seed';
 import { connectBox } from '@/lib/session';
@@ -37,34 +37,26 @@ export async function POST(
     const { owner, repo } = parseRepo(manifest.repoUrl);
     await mergePullRequest(owner, repo, manifest.prNumber, token);
 
-    // Merged → start a fresh branch off the updated base for the next session.
+    // Merged → drop the branch (next task names a fresh <project>/<task>) and
+    // fast-forward the local base.
     const base = manifest.baseBranch ?? 'main';
-    const n = (manifest.sessionN ?? 1) + 1;
-    const branch = `aned/${slug}-${n}`;
     try {
       const box = await connectBox(manifest);
       const app = await appDir(box);
       await pullBase(box, app, base, manifest.repoUrl, token);
-      await ensureBranch(box, app, branch, base);
-      const updated = await updateProject(slug, {
-        branch,
-        sessionN: n,
-        prUrl: undefined,
-        prNumber: undefined,
-      });
-      return NextResponse.json({
-        ok: true,
-        url: `https://github.com/${owner}/${repo}`,
-        manifest: updated,
-      });
     } catch {
-      // Sandbox gone — still clear PR state so the UI reflects the merge.
-      await updateProject(slug, { prUrl: undefined, prNumber: undefined });
-      return NextResponse.json({
-        ok: true,
-        url: `https://github.com/${owner}/${repo}`,
-      });
+      // sandbox gone — still clear PR state below
     }
+    const updated = await updateProject(slug, {
+      branch: '',
+      prUrl: undefined,
+      prNumber: undefined,
+    });
+    return NextResponse.json({
+      ok: true,
+      url: `https://github.com/${owner}/${repo}`,
+      manifest: updated,
+    });
   } catch (err) {
     return NextResponse.json(
       { ok: false, error: err instanceof Error ? err.message : String(err) },

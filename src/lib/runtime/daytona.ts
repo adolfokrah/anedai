@@ -26,18 +26,82 @@ import type {
   Runtime,
 } from './types';
 
-// Use Daytona's DEFAULT snapshot (not a custom image): it ships the toolbox's
-// expected shell (zsh at /usr/bin/zsh) plus node + git, so commands actually
-// run. A custom image without that shell makes every executeCommand fail with
-// "fork/exec /usr/bin/zsh: no such file". `resources` is image-only, so the box
-// gets default RAM — fine for scratch/SPA; heavy full-stack repos need a
-// prebuilt snapshot with more RAM (future).
+// Default: Daytona's DEFAULT snapshot — it ships the toolbox's expected shell
+// (zsh at /usr/bin/zsh) plus node + git, so commands run. A custom image/snapshot
+// MUST also include zsh, or every executeCommand fails with
+// "fork/exec /usr/bin/zsh: no such file". Heavy full-stack repos (Payload + Next
+// + Mongo) OOM on the default RAM — point DAYTONA_SNAPSHOT at a prebuilt snapshot
+// with more RAM (resources are baked in), or set DAYTONA_IMAGE + DAYTONA_CPU/
+// MEMORY/DISK. See sandboxConfig().
 const CREATE_TIMEOUT_S = 180;
 
 function client(): Daytona {
   const apiKey = process.env.DAYTONA_API_KEY;
   if (!apiKey) throw new Error('DAYTONA_API_KEY is not set');
-  return new Daytona({ apiKey, apiUrl: process.env.DAYTONA_API_URL });
+  // `target` (region) is a CLIENT-config field, not a create param — default EU.
+  return new Daytona({
+    apiKey,
+    apiUrl: process.env.DAYTONA_API_URL,
+    target: process.env.DAYTONA_TARGET || 'eu',
+  });
+}
+
+/**
+ * Extra create params from env, for heavy repos that OOM/ENOSPC on the default
+ * snapshot (e.g. Payload + Next + Mongo):
+ *  - DAYTONA_SNAPSHOT — a prebuilt snapshot name (must include the toolbox shell
+ *    zsh + node + git); resources are baked into the snapshot. PREFERRED.
+ *  - DAYTONA_IMAGE — a custom image (resources below apply to images).
+ *  - DAYTONA_CPU / DAYTONA_MEMORY / DAYTONA_DISK — cores / GiB / GiB. Honored
+ *    with an image/snapshot (Daytona ignores resources on the default snapshot).
+ *  - DAYTONA_TARGET — region the sandbox runs in. Defaults to 'eu'.
+ * None set → the default snapshot (fixed, smaller RAM), EU region.
+ */
+function sandboxConfig(): {
+  snapshot?: string;
+  image?: string;
+  resources?: { cpu?: number; memory?: number; disk?: number };
+} {
+  const cfg: {
+    snapshot?: string;
+    image?: string;
+    resources?: { cpu?: number; memory?: number; disk?: number };
+  } = {};
+  // Default to Daytona's `daytona-large` pre-built snapshot (4 vCPU / 8 GiB /
+  // 10 GiB, with the toolbox shell + node + git baked in) so a fresh Aned never
+  // silently ships the 1 GiB `daytona-small` default — real installs/monorepos
+  // OOM in 1 GiB. Override with DAYTONA_SNAPSHOT, or DAYTONA_IMAGE for a custom
+  // image (which also unlocks the DAYTONA_CPU/MEMORY/DISK overrides below).
+  // A custom image wins (and unlocks resource overrides); otherwise a snapshot.
+  // image + snapshot together is invalid, so never set both.
+  const DEFAULT_SNAPSHOT = 'daytona-large';
+  if (process.env.DAYTONA_IMAGE) {
+    cfg.image = process.env.DAYTONA_IMAGE;
+  } else {
+    cfg.snapshot = process.env.DAYTONA_SNAPSHOT || DEFAULT_SNAPSHOT;
+  }
+  const num = (v?: string) => {
+    const n = v ? Number(v) : Number.NaN;
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+  };
+  // Resources can ONLY be specified with an IMAGE. Daytona bakes resources into
+  // snapshots and rejects create() with "Cannot specify Sandbox resources when
+  // using a snapshot" — this includes the DEFAULT snapshot used when no image is
+  // set. So: size up by setting DAYTONA_IMAGE; sizing comes from the snapshot
+  // otherwise.
+  if (cfg.image && !cfg.snapshot) {
+    // Default to the Tier-2 per-sandbox ceiling (1 GiB OOMs real installs);
+    // override any axis via env.
+    const DEFAULT_CPU = 4;
+    const DEFAULT_MEMORY = 8; // GiB
+    const DEFAULT_DISK = 10; // GiB
+    cfg.resources = {
+      cpu: num(process.env.DAYTONA_CPU) ?? DEFAULT_CPU,
+      memory: num(process.env.DAYTONA_MEMORY) ?? DEFAULT_MEMORY,
+      disk: num(process.env.DAYTONA_DISK) ?? DEFAULT_DISK,
+    };
+  }
+  return cfg;
 }
 
 function secs(ms?: number): number | undefined {
@@ -131,15 +195,22 @@ class DaytonaBox implements Box {
 
 export class DaytonaRuntime implements Runtime {
   async create(opts: CreateOptions = {}): Promise<Box> {
-    const sbx = await client().create(
-      { public: true },
-      {
-        timeout: opts.timeoutMs
-          ? Math.ceil(opts.timeoutMs / 1000)
-          : CREATE_TIMEOUT_S,
-      },
+    const params = { public: true, ...sandboxConfig() };
+    const sbx = await client().create(params, {
+      timeout: opts.timeoutMs
+        ? Math.ceil(opts.timeoutMs / 1000)
+        : CREATE_TIMEOUT_S,
+    });
+    console.log(
+      `[daytona] created sandbox ${sbx.id}`,
+      params.snapshot
+        ? `(snapshot ${params.snapshot})`
+        : params.image
+          ? `(image ${params.image})`
+          : params.resources
+            ? `(resources ${JSON.stringify(params.resources)})`
+            : '(default snapshot)',
     );
-    console.log(`[daytona] created sandbox ${sbx.id} (default snapshot)`);
     return new DaytonaBox(sbx);
   }
 

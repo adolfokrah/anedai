@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 
-import { appDir } from '@/lib/seed';
+import { workDir } from '@/lib/seed';
 import { connectBox } from '@/lib/session';
 import { getProject } from '@/lib/store';
 import type { FileNode } from '@/lib/types';
@@ -22,7 +22,7 @@ export async function GET(
 
   try {
     const box = await connectBox(manifest);
-    const app = await appDir(box);
+    const app = await workDir(box, manifest);
     const dir = rel ? `${app}/${rel.replace(/^\/+/, '')}` : app;
     const entries = await box.listDir(dir);
     const nodes: FileNode[] = entries

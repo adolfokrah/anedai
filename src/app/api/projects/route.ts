@@ -1,5 +1,7 @@
 import { NextResponse } from 'next/server';
 
+import { parseEnv } from '@/lib/env';
+import { classifyKind } from '@/lib/seed/template';
 import { listProjects, saveProject, slugify } from '@/lib/store';
 import type { ProjectManifest, ProjectMode } from '@/lib/types';
 
@@ -11,8 +13,19 @@ interface CreateBody {
   mode: ProjectMode;
   name?: string;
   repoUrl?: string;
+  subdir?: string;
+  startCmd?: string;
+  docsStartCmd?: string;
+  docsSubdir?: string;
+  /** Raw `.env` text the user pasted (repo mode). */
+  envText?: string;
   initialPrompt?: string;
+  initialMode?: 'build' | 'plan';
+  model?: string;
 }
+
+const trimDir = (s?: string) =>
+  s?.trim().replace(/^\/+|\/+$/g, '') || undefined;
 
 export async function POST(req: Request) {
   const body = (await req.json().catch(() => ({}))) as CreateBody;
@@ -38,8 +51,23 @@ export async function POST(req: Request) {
     name,
     mode,
     repoUrl: mode === 'repo' ? body.repoUrl?.trim() : undefined,
+    subdir: mode === 'repo' ? trimDir(body.subdir) : undefined,
+    startCmd: mode === 'repo' ? body.startCmd?.trim() || undefined : undefined,
+    docsStartCmd:
+      mode === 'repo' ? body.docsStartCmd?.trim() || undefined : undefined,
+    docsSubdir: mode === 'repo' ? trimDir(body.docsSubdir) : undefined,
+    env:
+      mode === 'repo' && body.envText?.trim()
+        ? parseEnv(body.envText)
+        : undefined,
     initialPrompt: mode === 'scratch' ? body.initialPrompt?.trim() : undefined,
-    branch: `aned/${slug}`,
+    initialMode:
+      mode === 'scratch' && body.initialMode === 'plan' ? 'plan' : undefined,
+    kind:
+      mode === 'scratch' ? classifyKind(body.initialPrompt ?? '') : undefined,
+    model: body.model,
+    // Named on the first task of each session: <project>/<task-title>.
+    branch: '',
     devPort: 3000,
     status: 'new',
     createdAt: new Date().toISOString(),
